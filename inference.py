@@ -1,118 +1,61 @@
 import os
 import json
+import random
 import requests
 import sys
 from openai import OpenAI
 
-# Required Environment variables injected by validator
-API_BASE_URL = os.environ.get("API_BASE_URL")
-API_KEY = os.environ.get("API_KEY")
-MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-3.5-turbo")
-SPACE_URL = os.environ.get("SPACE_URL", "https://tanishkushwah72-verity-human-verification.hf.space")
+# Environment variables (with defaults as required)
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4.1-mini")
+HF_TOKEN = os.getenv("HF_TOKEN")
+if HF_TOKEN is None:
+    print("ERROR: HF_TOKEN environment variable is required", file=sys.stderr)
+    sys.exit(1)
 
-def log_start(task, env, model):
-    print(f"[START] {json.dumps({'task': task, 'env': env, 'model': model})}", flush=True)
+client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+SPACE_URL = os.getenv("SPACE_URL", "https://tanishkushwah72-verity-human-verification.hf.space")
 
-def log_step(step, action, reward, done, error=None):
-    payload = {'step': step, 'action': action, 'reward': reward, 'done': done}
-    if error:
-        payload['error'] = error
-    print(f"[STEP] {json.dumps(payload)}", flush=True)
+def llm_priority(obs):
+    prompt = f"PR: {obs.get('title')}\n{obs.get('description')}\nReturn 0,1,2"
+    resp = client.chat.completions.create(model=MODEL_NAME, messages=[{"role":"user","content":prompt}], temperature=0, max_tokens=5)
+    return int(resp.choices[0].message.content.strip())
 
-def log_end(success, steps, score, rewards):
-    print(f"[END] {json.dumps({'success': success, 'steps': steps, 'score': score, 'rewards': rewards})}", flush=True)
-
-def llm_priority(client, obs):
-    prompt = f"""You are a senior developer prioritizing pull requests.
-PR Title: {obs.get('pr_title', '')}
-Description: {obs.get('pr_description', '')}
-Files changed: {obs.get('files_changed', 0)}
-Labels: {obs.get('labels', [])}
-Author: {obs.get('author', '')}
-
-Return only an integer 0 (Low), 1 (Medium), or 2 (High)."""
-
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0
-        )
-        content = resp.choices[0].message.content.strip()
-        # Handle cases where LLM might include extra text
-        import re
-        match = re.search(r'\d+', content)
-        if match:
-             return int(match.group())
-        return 1
-    except Exception as e:
-        print(f"[DEBUG] Model request failed: {e}", file=sys.stderr)
-        return 1  # Default to medium if it fails
-
-def evaluate_task(client, task, episodes=3):
-    try:
-        # Create session
-        reset_res = requests.post(f"{SPACE_URL}/reset", json={"task": task}, timeout=10)
-        reset_res.raise_for_status()
-        sess = reset_res.json().get("session_id")
-    except Exception as e:
-        print(f"[DEBUG] Error creating session for task {task}: {e}", file=sys.stderr)
-        return 0.0, []
-
-    total_reward = 0.0
+def run_task(task):
+    base = SPACE_URL.rstrip('/')
+    # Start episode
+    print(f"[START] task={task} env=pr-priority-pilot model={MODEL_NAME}")
+    r = requests.post(f"{base}/reset", json={"task": task}, timeout=10)
+    r.raise_for_status()
+    sid = r.json()["session_id"]
+    steps = 0
     rewards = []
-    
-    for ep in range(episodes):
-        try:
-            # Reset environment for this episode
-            obs_res = requests.post(f"{SPACE_URL}/reset", json={"session_id": sess, "task": task}, timeout=10)
-            obs_res.raise_for_status()
-            obs = obs_res.json().get("observation", {})
-            
-            action = llm_priority(client, obs)
-            
-            # Step the environment
-            step_res = requests.post(f"{SPACE_URL}/step", json={"session_id": sess, "action": {"priority": action}}, timeout=10)
-            step_res.raise_for_status()
-            
-            result = step_res.json()
-            reward = result.get("reward", 0.0)
-            done = result.get("done", True)
-            
-            total_reward += reward
+    try:
+        for ep in range(3):  # 3 episodes per task (or steps?)
+            # Get PR
+            r2 = requests.post(f"{base}/reset", json={"session_id": sid, "task": task}, timeout=10)
+            r2.raise_for_status()
+            obs = r2.json()["observation"]
+            action = llm_priority(obs)
+            steps += 1
+            r3 = requests.post(f"{base}/step?session_id={sid}", json={"priority": action}, timeout=10)
+            r3.raise_for_status()
+            reward = r3.json().get("reward", 0.0)
             rewards.append(reward)
-            
-            log_step(step=ep + 1, action=str(action), reward=reward, done=done)
-            
-            # Re-create session for next episode if done
-            if done and ep < episodes - 1:
-                sess = requests.post(f"{SPACE_URL}/reset", json={"task": task}, timeout=10).json().get("session_id")
-
-        except Exception as e:
-            print(f"[DEBUG] Error during step {ep + 1} for task {task}: {e}", file=sys.stderr)
-            log_step(step=ep + 1, action="error", reward=0.0, done=True, error=str(e))
-            rewards.append(0.0)
-            break
-            
-    avg_score = total_reward / episodes if episodes > 0 else 0.0
-    return avg_score, rewards
+            print(f"[STEP] step={steps} action={action} reward={reward:.2f} done=true error=null")
+        success = True
+    except Exception as e:
+        success = False
+        print(f"[STEP] step={steps+1} action=error reward=0.00 done=true error={str(e)}")
+    finally:
+        rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+        print(f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}")
 
 def main():
-    if not API_BASE_URL or not API_KEY:
-        print("ERROR: API_BASE_URL and API_KEY environment variables must be set.", file=sys.stderr)
-        # Even if missing, we must let it proceed or fail properly during evaluation?
-        # The instructions say to use these injected variables, so let's continue and error at runtime.
-    
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-
-    tasks = ["easy", "medium", "hard"]
-    
-    for task in tasks:
-        log_start(task=task, env="pr-priority-pilot", model=MODEL_NAME)
-        score, rewards = evaluate_task(client, task, episodes=3)
-        success = score > 0.0  # Or appropriately scaled
-        log_end(success=success, steps=len(rewards), score=score, rewards=rewards)
+    for task in ["easy", "medium", "hard"]:
+        run_task(task)
+    sys.exit(0)
 
 if __name__ == "__main__":
+    random.seed(42)
     main()
-
