@@ -1,13 +1,10 @@
 name: pr-priority-pilot
 version: 1.0
-description: Code review prioritizer
+description: Three‑task prioritizer
 actions: Discrete(3)
 observations:
-  pr_title: string
-  pr_description: string
-  files_changed: int
-  labels: list
-  author: string
+  title: string
+  description: string
 tasks:
   - easy
   - medium
