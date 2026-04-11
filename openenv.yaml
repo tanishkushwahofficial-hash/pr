@@ -1,6 +1,6 @@
 name: pr-priority-pilot
 version: 1.0
-description: Three‑task prioritizer
+description: Three‑task prioritizer with guaranteed (0,1) scores
 actions: Discrete(3)
 observations:
   title: string
